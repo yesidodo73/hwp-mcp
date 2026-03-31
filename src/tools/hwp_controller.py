@@ -5,6 +5,8 @@ win32com을 이용하여 한글 프로그램을 자동화합니다.
 
 import os
 import logging
+import subprocess
+import sys
 import win32com.client
 import win32gui
 import win32con
@@ -66,12 +68,100 @@ class HwpController:
         logger.log(level, detail, exc_info=exc is not None and level >= logging.ERROR)
         return detail
 
+    @staticmethod
+    def _text_quality_score(text: str) -> int:
+        """Heuristic score to prefer human-readable Korean output."""
+        hangul = sum("가" <= ch <= "힣" for ch in text)
+        ascii_text = sum(ch.isascii() and ch.isalnum() for ch in text)
+        mojibake = sum(ord(ch) > 127 and not ("가" <= ch <= "힣") and not ch.isspace() for ch in text)
+        return (hangul * 4) + ascii_text - (mojibake * 2)
+
+    def _normalize_extracted_text(self, text: str) -> str:
+        """Repair mojibake returned by HWP text export when possible."""
+        if not text:
+            return text
+
+        try:
+            repaired = text.encode("latin1").decode("cp949")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return text
+
+        if self._text_quality_score(repaired) > self._text_quality_score(text):
+            return repaired
+
+        return text
+
     def _ensure_com_initialized(self) -> None:
         """현재 스레드에서 COM을 초기화합니다."""
         try:
             pythoncom.CoInitialize()
         except Exception as e:
             logger.debug(f"CoInitialize 건너뜀: {e}")
+
+    def _try_get_active_object(
+        self,
+        retries: int = 3,
+        delay_seconds: float = 0.3,
+    ) -> Tuple[Optional[Any], Optional[Exception]]:
+        """이미 실행 중인 HWP COM 인스턴스에 연결을 시도합니다."""
+        active_object_error: Optional[Exception] = None
+
+        for attempt in range(retries):
+            try:
+                hwp = win32com.client.GetActiveObject("HWPFrame.HwpObject")
+                logger.info("GetActiveObject 성공 - 기존 HWP 인스턴스에 연결됨")
+                return hwp, None
+            except Exception as e:
+                active_object_error = e
+                logger.warning(f"GetActiveObject 실패 (시도 {attempt + 1}/{retries}): {e}")
+                if attempt < retries - 1:
+                    time.sleep(delay_seconds)
+
+        return None, active_object_error
+
+    def _bootstrap_hwp_via_subprocess(self, timeout_seconds: int = 30) -> bool:
+        """별도 Python 프로세스에서 HWP COM 서버를 먼저 기동합니다."""
+        bootstrap_script = (
+            "import sys, time, win32com.client; "
+            "win32com.client.Dispatch('HWPFrame.HwpObject'); "
+            "sys.stdout.write('BOOTSTRAP_OK\\n'); "
+            "sys.stdout.flush(); "
+            "time.sleep(3)"
+        )
+        command = [sys.executable or "python", "-X", "utf8", "-c", bootstrap_script]
+        run_kwargs = {
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": timeout_seconds,
+            "check": False,
+        }
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if create_no_window:
+            run_kwargs["creationflags"] = create_no_window
+
+        try:
+            result = subprocess.run(command, **run_kwargs)
+        except Exception as e:
+            self._record_error("한글 COM 부트스트랩 프로세스 실행 실패", e, level=logging.WARNING)
+            return False
+
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        if stdout:
+            logger.info(f"HWP bootstrap stdout: {stdout}")
+        if stderr:
+            logger.warning(f"HWP bootstrap stderr: {stderr}")
+
+        if result.returncode != 0:
+            self._record_error(
+                f"한글 COM 부트스트랩 프로세스가 종료 코드 {result.returncode}로 실패했습니다",
+                level=logging.WARNING,
+            )
+            return False
+
+        return True
 
     def _list_visible_hwp_windows(self) -> List[Dict[str, Any]]:
         """현재 실행 중인 HWP 창 목록을 반환합니다."""
@@ -189,13 +279,19 @@ class HwpController:
         self._clear_error()
         return True
 
-    def connect(self, visible: bool = True, register_security_module: bool = True) -> bool:
+    def connect(
+        self,
+        visible: bool = True,
+        register_security_module: bool = True,
+        allow_direct_dispatch: bool = True,
+    ) -> bool:
         """
         한글 프로그램에 연결합니다.
 
         Args:
             visible (bool): 한글 창을 화면에 표시할지 여부
             register_security_module (bool): 보안 모듈을 등록할지 여부
+            allow_direct_dispatch (bool): 현재 프로세스에서 직접 Dispatch로 한글을 기동할지 여부
 
         Returns:
             bool: 연결 성공 여부
@@ -207,17 +303,9 @@ class HwpController:
         self.visible = visible
         self._clear_error()
 
-        active_object_error = None
-        for attempt in range(3):
-            try:
-                hwp = win32com.client.GetActiveObject("HWPFrame.HwpObject")
-                logger.info("GetActiveObject 성공 - 기존 HWP 인스턴스에 연결됨")
-                return self._finalize_connection(hwp, visible, register_security_module)
-            except Exception as e:
-                active_object_error = e
-                logger.warning(f"GetActiveObject 실패 (시도 {attempt + 1}/3): {e}")
-                if attempt < 2:
-                    time.sleep(0.3)
+        hwp, active_object_error = self._try_get_active_object()
+        if hwp is not None:
+            return self._finalize_connection(hwp, visible, register_security_module)
 
         running_windows = self._list_visible_hwp_windows()
         if running_windows:
@@ -225,6 +313,14 @@ class HwpController:
             self._record_error(
                 f"한글 창은 실행 중이지만 COM 연결에 실패했습니다. 열린 창: {window_titles}. 한글을 완전히 종료한 뒤 다시 실행해 주세요",
                 active_object_error,
+            )
+            return False
+
+        if not allow_direct_dispatch:
+            self._record_error(
+                "한글 프로그램 자동 시작이 필요합니다",
+                active_object_error,
+                level=logging.WARNING,
             )
             return False
 
@@ -1052,10 +1148,12 @@ class HwpController:
         try:
             if not self.is_hwp_running:
                 return ""
-            
-            return self.hwp.GetTextFile("TEXT", "")
+
+            text = self.hwp.GetTextFile("TEXT", "")
+            self._clear_error()
+            return self._normalize_extracted_text(text)
         except Exception as e:
-            print(f"텍스트 가져오기 실패: {e}")
+            self._record_error("텍스트 가져오기 실패", e)
             return ""
 
     def set_page_setup(self, orientation: str = "portrait", margin_left: int = 1000, 

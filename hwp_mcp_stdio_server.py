@@ -7,8 +7,14 @@ import json
 import logging
 import ssl
 import tempfile
-from threading import local
+import atexit
+import ctypes
+import queue
+import socket
+import subprocess
+import threading
 import time
+import uuid
 
 # Configure logging
 log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hwp_mcp_stdio_server.log")
@@ -87,29 +93,500 @@ mcp = FastMCP(
     dependencies=["pywin32>=305"]
 )
 
-# Per-thread HWP controller state
-thread_state = local()
+_SIMPLE_RETURN_TYPES = (str, int, float, bool, bytes, type(None))
+ROOT_ENSURE_TIMEOUT_SECONDS = 75.0
+BROKER_CONNECT_TIMEOUT_SECONDS = 5.0
 
 
-def _set_thread_state(name, value):
-    setattr(thread_state, name, value)
+def _broker_state_path() -> str:
+    temp_root = os.path.join(tempfile.gettempdir(), "hwp-mcp")
+    os.makedirs(temp_root, exist_ok=True)
+    return os.path.join(temp_root, "broker_state.json")
 
 
-def _get_thread_state(name, default=None):
-    return getattr(thread_state, name, default)
+def _is_marshaled_value(value) -> bool:
+    if isinstance(value, _SIMPLE_RETURN_TYPES):
+        return True
+    if isinstance(value, tuple):
+        return all(_is_marshaled_value(item) for item in value)
+    if isinstance(value, list):
+        return all(_is_marshaled_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, _SIMPLE_RETURN_TYPES) and _is_marshaled_value(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+class HwpComWorker:
+    """Persistent helper-process client for all HWP automation."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending_lock = threading.Lock()
+        self._pending = {}
+        self._process = None
+        self._socket = None
+        self._socket_reader = None
+        self._reader_thread = None
+        self._last_hwp_error = None
+        self._helper_script = os.path.join(current_dir, "hwp_mcp_helper.py")
+        self._startup_cooldown_until = 0.0
+        self._startup_cooldown_message = None
+
+    def _set_last_hwp_error(self, message) -> None:
+        self._last_hwp_error = message
+
+    def _set_startup_cooldown(self, message: str, seconds: float = 90.0) -> None:
+        self._startup_cooldown_until = time.time() + seconds
+        self._startup_cooldown_message = message
+        self._set_last_hwp_error(message)
+
+    def _clear_startup_cooldown(self) -> None:
+        self._startup_cooldown_until = 0.0
+        self._startup_cooldown_message = None
+
+    def _in_startup_cooldown(self) -> bool:
+        return time.time() < self._startup_cooldown_until
+
+    def last_error_message(self) -> str:
+        return self._last_hwp_error or "Failed to connect to HWP program"
+
+    def _cleanup_hwp_processes(self) -> None:
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "$targets = Get-Process Hwp,HwpApi -ErrorAction SilentlyContinue; "
+                    "if ($targets) { $targets | Stop-Process -Force }",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                check=False,
+            )
+            if result.returncode != 0 and (result.stderr or "").strip():
+                logger.warning(f"HWP cleanup stderr: {result.stderr.strip()}")
+        except Exception as exc:
+            logger.warning(f"Failed to cleanup HWP processes: {exc}")
+
+    @staticmethod
+    def _is_root_ensure_request(command: str, payload: dict) -> bool:
+        return command == "ensure_root" and payload.get("root") in {"controller", "table_tools"}
+
+    @staticmethod
+    def _running_in_job() -> bool:
+        try:
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, os.getpid())
+            if not handle:
+                return False
+            try:
+                in_job = ctypes.c_int()
+                if not kernel32.IsProcessInJob(handle, 0, ctypes.byref(in_job)):
+                    return False
+                return bool(in_job.value)
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+
+    def _broker_unavailable_message(self) -> str:
+        return (
+            "외부 HWP broker가 실행 중이 아닙니다. "
+            "start_hwp_broker.ps1로 broker를 먼저 실행해 주세요."
+        )
+
+    def _connect_to_external_broker(self) -> bool:
+        state_path = _broker_state_path()
+        if not os.path.exists(state_path):
+            self._set_last_hwp_error(self._broker_unavailable_message())
+            return False
+
+        try:
+            with open(state_path, "r", encoding="utf-8") as fp:
+                state = json.load(fp)
+            port = int(state["port"])
+        except Exception as exc:
+            self._set_last_hwp_error(f"외부 HWP broker 상태 파일을 읽지 못했습니다: {exc}")
+            return False
+
+        try:
+            sock = socket.create_connection(
+                ("127.0.0.1", port),
+                timeout=BROKER_CONNECT_TIMEOUT_SECONDS,
+            )
+            sock.settimeout(None)
+            reader = sock.makefile("r", encoding="utf-8", errors="replace")
+        except Exception as exc:
+            self._set_last_hwp_error(f"외부 HWP broker 연결 실패: {exc}")
+            return False
+
+        self._socket = sock
+        self._socket_reader = reader
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            args=(reader,),
+            name="hwp-broker-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+        return True
+
+    def _start_process(self) -> None:
+        if self._socket is not None:
+            return
+
+        if self._process is not None and self._process.poll() is None:
+            return
+
+        if self._running_in_job():
+            if self._connect_to_external_broker():
+                return
+            raise RuntimeError(self.last_error_message())
+
+        self._process = subprocess.Popen(
+            [sys.executable, self._helper_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=current_dir,
+            bufsize=1,
+        )
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            args=(self._process.stdout,),
+            name="hwp-helper-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+    def _bootstrap_hwp_process(self) -> bool:
+        bootstrap_script = (
+            "import sys, time, win32com.client; "
+            "win32com.client.Dispatch('HWPFrame.HwpObject'); "
+            "sys.stdout.write('BOOTSTRAP_OK\\n'); "
+            "sys.stdout.flush(); "
+            "time.sleep(3)"
+        )
+        command = [sys.executable, "-X", "utf8", "-c", bootstrap_script]
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+                cwd=current_dir,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to bootstrap HWP process: {exc}", exc_info=True)
+            self._set_last_hwp_error(f"Failed to bootstrap HWP process: {exc}")
+            return False
+
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        if stdout:
+            logger.info(f"HWP bootstrap stdout: {stdout}")
+        if stderr:
+            logger.warning(f"HWP bootstrap stderr: {stderr}")
+
+        if result.returncode != 0:
+            message = f"HWP bootstrap process failed with exit code {result.returncode}"
+            logger.error(message)
+            self._set_last_hwp_error(message)
+            return False
+
+        return True
+
+    @staticmethod
+    def _should_retry_with_bootstrap(command: str, payload: dict, last_error: str) -> bool:
+        if command != "ensure_root":
+            return False
+        if payload.get("root") not in {"controller", "table_tools"}:
+            return False
+        return bool(last_error)
+
+    def _perform_request_locked(self, command: str, timeout: float, payload: dict):
+        if (
+            command == "ensure_root"
+            and payload.get("root") in {"controller", "table_tools"}
+            and self._in_startup_cooldown()
+        ):
+            message = self._startup_cooldown_message or "최근 한글 시작 실패로 잠시 재시도를 중단합니다."
+            return {
+                "ok": True,
+                "exists": False,
+                "last_error": message,
+            }
+
+        self._start_process()
+
+        if self._socket is None and (self._process is None or self._process.stdin is None):
+            raise RuntimeError("Failed to start HWP helper process")
+
+        request_id = uuid.uuid4().hex
+        waiter = queue.Queue(maxsize=1)
+        with self._pending_lock:
+            self._pending[request_id] = waiter
+
+        message = {"id": request_id, "command": command}
+        message.update(payload)
+
+        try:
+            self._send_request_message(message)
+        except Exception as exc:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            self.shutdown()
+            raise RuntimeError(f"Failed to send request to HWP helper: {exc}") from exc
+
+        try:
+            response = waiter.get(timeout=timeout)
+        except queue.Empty as exc:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            raise TimeoutError("HWP 작업이 제한 시간 내에 완료되지 않았습니다.") from exc
+
+        with self._pending_lock:
+            self._pending.pop(request_id, None)
+
+        last_error = response.get("last_error")
+        self._set_last_hwp_error(last_error)
+        return response
+
+    def _send_request_message(self, message: dict) -> None:
+        payload = json.dumps(message, ensure_ascii=False) + "\n"
+
+        if self._socket is not None:
+            self._socket.sendall(payload.encode("utf-8"))
+            return
+
+        if self._process is not None and self._process.stdin is not None:
+            self._process.stdin.write(payload)
+            self._process.stdin.flush()
+            return
+
+        raise RuntimeError("HWP helper transport is not available")
+
+    def _reader_loop(self, stream) -> None:
+        try:
+            while stream is not None:
+                line = stream.readline()
+                if not line:
+                    break
+
+                try:
+                    response = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.error(f"Invalid helper response: {line!r}")
+                    continue
+
+                request_id = response.get("id")
+                with self._pending_lock:
+                    waiter = self._pending.get(request_id)
+
+                if waiter is not None:
+                    waiter.put(response)
+        finally:
+            self._fail_pending_requests("HWP helper process closed the transport")
+
+    def _fail_pending_requests(self, message: str) -> None:
+        with self._pending_lock:
+            pending = list(self._pending.items())
+            self._pending.clear()
+
+        for _, waiter in pending:
+            waiter.put({"ok": False, "error": message, "last_error": self._last_hwp_error})
+
+    def request(self, command: str, timeout: float = 120.0, _allow_bootstrap_retry: bool = True, **payload):
+        with self._lock:
+            try:
+                response = self._perform_request_locked(command, timeout, payload)
+            except TimeoutError:
+                if _allow_bootstrap_retry and self._is_root_ensure_request(command, payload) and timeout < ROOT_ENSURE_TIMEOUT_SECONDS:
+                    logger.warning("Retrying HWP helper connection after timeout")
+                    self.shutdown()
+                    self._cleanup_hwp_processes()
+                    time.sleep(1.0)
+                    try:
+                        response = self._perform_request_locked(command, min(timeout, 30.0), payload)
+                    except TimeoutError:
+                        self._set_startup_cooldown("한글 시작이 제한 시간 내에 완료되지 않아 잠시 재시도를 중단합니다.")
+                        raise
+                else:
+                    if self._is_root_ensure_request(command, payload):
+                        self.shutdown()
+                        self._cleanup_hwp_processes()
+                        self._set_startup_cooldown("한글 시작이 제한 시간 내에 완료되지 않아 잠시 재시도를 중단합니다.")
+                    raise
+
+            last_error = response.get("last_error") or response.get("error") or ""
+            needs_bootstrap_retry = (
+                _allow_bootstrap_retry
+                and self._should_retry_with_bootstrap(command, payload, last_error)
+                and (
+                    not response.get("ok", False)
+                    or not response.get("exists", True)
+                )
+            )
+
+            if needs_bootstrap_retry:
+                logger.warning("Retrying HWP helper connection after helper error")
+                self.shutdown()
+                self._cleanup_hwp_processes()
+                time.sleep(1.0)
+                retry_response = self._perform_request_locked(command, min(timeout, 30.0), payload)
+                retry_last_error = retry_response.get("last_error") or retry_response.get("error") or ""
+                self._set_last_hwp_error(retry_last_error)
+                if not retry_response.get("ok", False):
+                    self._set_startup_cooldown(retry_last_error or "한글 시작 실패로 잠시 재시도를 중단합니다.")
+                    raise RuntimeError(retry_response.get("error", "Unknown HWP helper error"))
+                if not retry_response.get("exists", True):
+                    self._set_startup_cooldown(retry_last_error or "한글 시작 실패로 잠시 재시도를 중단합니다.")
+                return retry_response
+
+            if not response.get("ok", False):
+                raise RuntimeError(response.get("error", "Unknown HWP helper error"))
+
+            if response.get("exists", True):
+                self._clear_startup_cooldown()
+
+            return response
+
+    def clear_state(self) -> None:
+        try:
+            self.request("clear_state", timeout=10)
+        except Exception:
+            self._set_last_hwp_error(None)
+
+    def shutdown(self) -> None:
+        process = self._process
+        self._process = None
+        sock = self._socket
+        self._socket = None
+        reader = self._socket_reader
+        self._socket_reader = None
+
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                pass
+
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        if process is not None:
+            try:
+                if process.stdin:
+                    process.stdin.close()
+            except Exception:
+                pass
+
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+        self._fail_pending_requests("HWP helper process was terminated")
+
+
+class RemoteObjectProxy:
+    """Proxy that marshals every access through the helper process."""
+
+    def __init__(self, worker: HwpComWorker, object_id: str, label: str, is_root: bool = False):
+        object.__setattr__(self, "_worker", worker)
+        object.__setattr__(self, "_object_id", object_id)
+        object.__setattr__(self, "_label", label)
+        object.__setattr__(self, "_is_root", is_root)
+
+    def __bool__(self) -> bool:
+        try:
+            if self._is_root:
+                response = self._worker.request(
+                    "ensure_root",
+                    timeout=ROOT_ENSURE_TIMEOUT_SECONDS,
+                    root=self._object_id,
+                )
+            else:
+                response = self._worker.request("object_exists", timeout=30, object_id=self._object_id)
+            return bool(response.get("exists"))
+        except Exception:
+            return False
+
+    def __getattr__(self, name: str):
+        response = self._worker.request(
+            "inspect_attr",
+            timeout=30,
+            object_id=self._object_id,
+            name=name,
+        )
+        kind = response.get("kind")
+
+        if kind == "value":
+            return response.get("value")
+
+        if kind == "callable":
+            def _call(*args, **kwargs):
+                result = self._worker.request(
+                    "call_method",
+                    timeout=120,
+                    object_id=self._object_id,
+                    name=name,
+                    args=args,
+                    kwargs=kwargs,
+                )
+                if result.get("kind") == "value":
+                    return result.get("value")
+
+                return RemoteObjectProxy(
+                    self._worker,
+                    result["object_id"],
+                    f"{self._label}.{name}()",
+                )
+
+            return _call
+
+        return RemoteObjectProxy(
+            self._worker,
+            response["object_id"],
+            f"{self._label}.{name}",
+        )
+
+
+hwp_worker = HwpComWorker()
+atexit.register(hwp_worker.shutdown)
 
 
 def _clear_hwp_thread_state():
-    _set_thread_state("hwp_controller", None)
-    _set_thread_state("hwp_table_tools", None)
+    hwp_worker.clear_state()
 
 
 def _set_last_hwp_error(message):
-    _set_thread_state("last_hwp_error", message)
+    hwp_worker._set_last_hwp_error(message)
 
 
 def _connection_error_message() -> str:
-    return _get_thread_state("last_hwp_error") or "Failed to connect to HWP program"
+    return hwp_worker.last_error_message()
 
 
 def _connection_error_response() -> str:
@@ -125,50 +602,25 @@ def _default_temp_document_path() -> str:
     os.makedirs(temp_root, exist_ok=True)
     return os.path.join(temp_root, f"document-{int(time.time() * 1000)}.hwp")
 
+
 def get_hwp_controller():
-    """Get or create HwpController instance. Auto-reconnects if connection is lost."""
-    hwp_controller = _get_thread_state("hwp_controller")
+    """Return a proxy backed by the helper process."""
+    return RemoteObjectProxy(
+        hwp_worker,
+        "controller",
+        "HwpController",
+        is_root=True,
+    )
 
-    # 연결 상태 확인 및 재연결
-    if hwp_controller is not None:
-        try:
-            # 간단한 연결 테스트
-            _ = hwp_controller.hwp.XHwpWindows.Count
-        except Exception as e:
-            logger.warning(f"HWP connection lost ({e}), attempting to reconnect...")
-            _clear_hwp_thread_state()
-            hwp_controller = None
-
-    if hwp_controller is None:
-        logger.info("Creating HwpController instance...")
-        try:
-            controller = HwpController()
-            if not controller.connect(visible=True):
-                message = controller.last_error or "Failed to connect to HWP program"
-                _set_last_hwp_error(message)
-                logger.error(f"Failed to connect to HWP program: {message}")
-                return None
-
-            _set_thread_state("hwp_controller", controller)
-            _set_thread_state("hwp_table_tools", HwpTableTools(controller))
-            _set_last_hwp_error(None)
-            logger.info("Successfully connected to HWP program")
-            hwp_controller = controller
-        except Exception as e:
-            logger.error(f"Error creating HwpController: {str(e)}", exc_info=True)
-            _set_last_hwp_error(str(e))
-            return None
-    return hwp_controller
 
 def get_hwp_table_tools():
-    """Get or create HwpTableTools instance."""
-    hwp_table_tools = _get_thread_state("hwp_table_tools")
-    if hwp_table_tools is None:
-        hwp_controller = get_hwp_controller()
-        if hwp_controller:
-            hwp_table_tools = HwpTableTools(hwp_controller)
-            _set_thread_state("hwp_table_tools", hwp_table_tools)
-    return hwp_table_tools
+    """Return a proxy backed by the helper process."""
+    return RemoteObjectProxy(
+        hwp_worker,
+        "table_tools",
+        "HwpTableTools",
+        is_root=True,
+    )
 
 @mcp.tool()
 def hwp_create() -> str:

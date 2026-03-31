@@ -63,6 +63,27 @@ class TestHwpController:
     @patch("src.tools.hwp_controller.pythoncom.CoInitialize")
     @patch("src.tools.hwp_controller.win32com.client.Dispatch")
     @patch("src.tools.hwp_controller.win32com.client.GetActiveObject")
+    def test_connect_fails_when_direct_dispatch_is_disabled(
+        self,
+        mock_get_active,
+        mock_dispatch,
+        mock_coinit,
+    ):
+        mock_get_active.side_effect = [Exception("unavailable")] * 3
+
+        controller = HwpController()
+
+        with patch.object(controller, "_list_visible_hwp_windows", return_value=[]):
+            assert controller.connect(allow_direct_dispatch=False) is False
+
+        mock_coinit.assert_called_once()
+        mock_dispatch.assert_not_called()
+        assert "자동 시작이 필요합니다" in controller.last_error
+        assert controller.is_hwp_running is False
+
+    @patch("src.tools.hwp_controller.pythoncom.CoInitialize")
+    @patch("src.tools.hwp_controller.win32com.client.Dispatch")
+    @patch("src.tools.hwp_controller.win32com.client.GetActiveObject")
     def test_connect_fails_safely_when_hwp_window_exists_but_com_is_unavailable(
         self,
         mock_get_active,
@@ -129,3 +150,20 @@ class TestHwpController:
         mock_insert.assert_any_call("Hello")
         mock_insert.assert_any_call("World")
         mock_paragraph.assert_called_once()
+
+    def test_get_text_repairs_mojibake_korean_output(self):
+        controller = HwpController()
+        controller.is_hwp_running = True
+        controller.hwp = _build_mock_hwp()
+        controller.hwp.GetTextFile.return_value = "¼­½Ä1 Âü°¡½ÅÃ»¼­"
+
+        assert controller.get_text() == "서식1 참가신청서"
+        assert controller.last_error is None
+
+    def test_get_text_keeps_plain_ascii_output(self):
+        controller = HwpController()
+        controller.is_hwp_running = True
+        controller.hwp = _build_mock_hwp()
+        controller.hwp.GetTextFile.return_value = "plain ascii text"
+
+        assert controller.get_text() == "plain ascii text"
