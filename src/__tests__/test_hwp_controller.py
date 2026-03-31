@@ -1,111 +1,131 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-Tests for HWP Controller
-"""
+"""Tests for the current HWP controller behavior."""
 
-import pytest
-import os
-import tempfile
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
 from src.tools.hwp_controller import HwpController
 
+
+def _build_mock_hwp():
+    mock_hwp = MagicMock()
+    mock_hwp.XHwpWindows.Count = 1
+    mock_hwp.XHwpWindows.Item.return_value = MagicMock()
+    mock_hwp.XHwpDocuments.Item.return_value = MagicMock(Path="")
+    mock_hwp.CurDocIndex = 0
+    mock_hwp.Path = ""
+    return mock_hwp
+
+
 class TestHwpController:
-    """Test suite for HWP Controller."""
+    """Focused tests for controller connection and basic document operations."""
 
-    @patch('win32com.client.Dispatch')
-    def test_initialize_hwp(self, mock_dispatch):
-        """Test HWP initialization."""
-        # Setup mock
-        mock_hwp = MagicMock()
-        mock_dispatch.return_value = mock_hwp
-        
-        # Initialize controller
+    @patch("src.tools.hwp_controller.os.path.exists", return_value=True)
+    @patch("src.tools.hwp_controller.pythoncom.CoInitialize")
+    @patch("src.tools.hwp_controller.win32com.client.GetActiveObject")
+    def test_connect_uses_existing_instance(self, mock_get_active, mock_coinit, mock_exists):
+        mock_hwp = _build_mock_hwp()
+        mock_get_active.return_value = mock_hwp
+
         controller = HwpController()
-        
-        # Verify initialization
+
+        assert controller.connect() is True
+        mock_coinit.assert_called_once()
+        mock_get_active.assert_called_once_with("HWPFrame.HwpObject")
+        mock_hwp.RegisterModule.assert_called_once()
+        assert controller.is_hwp_running is True
+        assert controller.last_error is None
+
+    @patch("src.tools.hwp_controller.os.path.exists", return_value=True)
+    @patch("src.tools.hwp_controller.pythoncom.CoInitialize")
+    @patch("src.tools.hwp_controller.win32com.client.Dispatch")
+    @patch("src.tools.hwp_controller.win32com.client.GetActiveObject")
+    def test_connect_dispatches_when_hwp_is_not_running(
+        self,
+        mock_get_active,
+        mock_dispatch,
+        mock_coinit,
+        mock_exists,
+    ):
+        mock_get_active.side_effect = [Exception("unavailable")] * 3
+        mock_dispatch.return_value = _build_mock_hwp()
+
+        controller = HwpController()
+
+        with patch.object(controller, "_list_visible_hwp_windows", return_value=[]):
+            assert controller.connect() is True
+
+        mock_coinit.assert_called_once()
         mock_dispatch.assert_called_once_with("HWPFrame.HwpObject")
-        assert controller.hwp is not None
+        assert controller.is_hwp_running is True
 
-    @patch('win32com.client.Dispatch')
-    def test_open_document(self, mock_dispatch):
-        """Test opening a document."""
-        # Setup mock
-        mock_hwp = MagicMock()
-        mock_dispatch.return_value = mock_hwp
-        
-        # Initialize controller
-        controller = HwpController()
-        
-        # Test open document
-        result = controller.execute({"type": "open_document", "params": {"path": "test.hwp"}})
-        
-        # Verify results
-        mock_hwp.Open.assert_called_once_with("test.hwp")
-        assert result["status"] == "success"
-        assert "Document opened" in result["message"]
+    @patch("src.tools.hwp_controller.pythoncom.CoInitialize")
+    @patch("src.tools.hwp_controller.win32com.client.Dispatch")
+    @patch("src.tools.hwp_controller.win32com.client.GetActiveObject")
+    def test_connect_fails_safely_when_hwp_window_exists_but_com_is_unavailable(
+        self,
+        mock_get_active,
+        mock_dispatch,
+        mock_coinit,
+    ):
+        mock_get_active.side_effect = [Exception("busy")] * 3
 
-    @patch('win32com.client.Dispatch')
-    def test_save_document(self, mock_dispatch):
-        """Test saving a document."""
-        # Setup mock
-        mock_hwp = MagicMock()
-        mock_dispatch.return_value = mock_hwp
-        
-        # Initialize controller
         controller = HwpController()
-        
-        # Create a temp file path
-        with tempfile.NamedTemporaryFile(suffix='.hwp', delete=False) as temp_file:
-            temp_path = temp_file.name
-        
-        try:
-            # Test save document
-            result = controller.execute({"type": "save_document", "params": {"path": temp_path}})
-            
-            # Verify results
-            mock_hwp.SaveAs.assert_called_once_with(temp_path)
-            assert result["status"] == "success"
-            assert "Document saved" in result["message"]
-        finally:
-            # Clean up
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
 
-    @patch('win32com.client.Dispatch')
-    def test_get_text(self, mock_dispatch):
-        """Test getting text from a document."""
-        # Setup mock
-        mock_hwp = MagicMock()
-        mock_hwp.GetTextFile.return_value = "Test document content"
-        mock_dispatch.return_value = mock_hwp
-        
-        # Initialize controller
-        controller = HwpController()
-        
-        # Test get text
-        result = controller.execute({"type": "get_text"})
-        
-        # Verify results
-        mock_hwp.GetTextFile.assert_called_once_with("TEXT", "")
-        assert result["status"] == "success"
-        assert result["data"] == "Test document content"
+        with patch.object(
+            controller,
+            "_list_visible_hwp_windows",
+            return_value=[{"hwnd": 100, "title": "example.hwp"}],
+        ):
+            assert controller.connect() is False
 
-    @patch('win32com.client.Dispatch')
-    def test_insert_text(self, mock_dispatch):
-        """Test inserting text into a document."""
-        # Setup mock
-        mock_hwp = MagicMock()
-        mock_dispatch.return_value = mock_hwp
-        
-        # Initialize controller
+        mock_coinit.assert_called_once()
+        mock_dispatch.assert_not_called()
+        assert "COM 연결에 실패했습니다" in controller.last_error
+        assert controller.is_hwp_running is False
+
+    @patch("src.tools.hwp_controller.os.path.exists", return_value=False)
+    def test_open_document_rejects_missing_path(self, mock_exists):
         controller = HwpController()
-        
-        # Test insert text
-        result = controller.execute({"type": "insert_text", "params": {"text": "Hello, World!"}})
-        
-        # Verify results
-        mock_hwp.InsertText.assert_called_once_with("Hello, World!")
-        assert result["status"] == "success"
-        assert "Text inserted successfully" in result["message"] 
+        controller.is_hwp_running = True
+        controller.hwp = _build_mock_hwp()
+
+        assert controller.open_document("missing.hwp") is False
+        assert "문서 파일을 찾을 수 없습니다" in controller.last_error
+        controller.hwp.HAction.Execute.assert_not_called()
+
+    @patch("src.tools.hwp_controller.os.makedirs")
+    def test_save_document_creates_parent_directory(self, mock_makedirs):
+        controller = HwpController()
+        controller.is_hwp_running = True
+        controller.hwp = _build_mock_hwp()
+
+        assert controller.save_document(r"nested\folder\document.hwp") is True
+        mock_makedirs.assert_called_once()
+        controller.hwp.SaveAs.assert_called_once()
+        assert controller.current_document_path.endswith(r"nested\folder\document.hwp")
+
+    def test_save_document_without_path_uses_active_document_path(self):
+        controller = HwpController()
+        controller.is_hwp_running = True
+        controller.hwp = _build_mock_hwp()
+        controller.hwp.Path = r"C:\docs\current.hwp"
+
+        assert controller.save_document() is True
+        controller.hwp.Save.assert_called_once()
+        assert controller.current_document_path == r"C:\docs\current.hwp"
+
+    def test_insert_text_preserves_linebreaks(self):
+        controller = HwpController()
+        controller.is_hwp_running = True
+        controller.hwp = _build_mock_hwp()
+
+        with patch.object(controller, "_insert_text_direct", return_value=True) as mock_insert:
+            with patch.object(controller, "insert_paragraph", return_value=True) as mock_paragraph:
+                assert controller.insert_text("Hello\nWorld") is True
+
+        assert mock_insert.call_count == 2
+        mock_insert.assert_any_call("Hello")
+        mock_insert.assert_any_call("World")
+        mock_paragraph.assert_called_once()

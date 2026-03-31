@@ -4,25 +4,33 @@
 import os
 import sys
 import json
-import traceback
 import logging
 import ssl
-from threading import Thread
+import tempfile
+from threading import local
 import time
 
 # Configure logging
+log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hwp_mcp_stdio_server.log")
+
 logging.basicConfig(
     level=logging.INFO,
-    filename="hwp_mcp_stdio_server.log",
+    filename=log_path,
     filemode="a",
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
-# 추가 스트림 핸들러 설정 (별도로 추가)
-stderr_handler = logging.StreamHandler(sys.stderr)
-stderr_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
 logger = logging.getLogger("hwp-mcp-stdio-server")
-logger.addHandler(stderr_handler)
+
+try:
+    sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
+except Exception:
+    pass
+
+if not any(isinstance(handler, logging.StreamHandler) for handler in logger.handlers):
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    logger.addHandler(stderr_handler)
 
 # Optional: Disable SSL certificate validation for development
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -79,14 +87,47 @@ mcp = FastMCP(
     dependencies=["pywin32>=305"]
 )
 
-# Global HWP controller instance
-hwp_controller = None
-# Global HWP table tools instance
-hwp_table_tools = None
+# Per-thread HWP controller state
+thread_state = local()
+
+
+def _set_thread_state(name, value):
+    setattr(thread_state, name, value)
+
+
+def _get_thread_state(name, default=None):
+    return getattr(thread_state, name, default)
+
+
+def _clear_hwp_thread_state():
+    _set_thread_state("hwp_controller", None)
+    _set_thread_state("hwp_table_tools", None)
+
+
+def _set_last_hwp_error(message):
+    _set_thread_state("last_hwp_error", message)
+
+
+def _connection_error_message() -> str:
+    return _get_thread_state("last_hwp_error") or "Failed to connect to HWP program"
+
+
+def _connection_error_response() -> str:
+    return f"Error: {_connection_error_message()}"
+
+
+def _connection_error_payload() -> dict:
+    return {"status": "error", "message": _connection_error_message()}
+
+
+def _default_temp_document_path() -> str:
+    temp_root = os.path.join(tempfile.gettempdir(), "hwp-mcp")
+    os.makedirs(temp_root, exist_ok=True)
+    return os.path.join(temp_root, f"document-{int(time.time() * 1000)}.hwp")
 
 def get_hwp_controller():
     """Get or create HwpController instance. Auto-reconnects if connection is lost."""
-    global hwp_controller, hwp_table_tools
+    hwp_controller = _get_thread_state("hwp_controller")
 
     # 연결 상태 확인 및 재연결
     if hwp_controller is not None:
@@ -95,33 +136,38 @@ def get_hwp_controller():
             _ = hwp_controller.hwp.XHwpWindows.Count
         except Exception as e:
             logger.warning(f"HWP connection lost ({e}), attempting to reconnect...")
+            _clear_hwp_thread_state()
             hwp_controller = None
-            hwp_table_tools = None
 
     if hwp_controller is None:
         logger.info("Creating HwpController instance...")
         try:
-            hwp_controller = HwpController()
-            if not hwp_controller.connect(visible=True):
-                logger.error("Failed to connect to HWP program")
+            controller = HwpController()
+            if not controller.connect(visible=True):
+                message = controller.last_error or "Failed to connect to HWP program"
+                _set_last_hwp_error(message)
+                logger.error(f"Failed to connect to HWP program: {message}")
                 return None
 
-            # 테이블 도구 인스턴스도 초기화
-            hwp_table_tools = HwpTableTools(hwp_controller)
-
+            _set_thread_state("hwp_controller", controller)
+            _set_thread_state("hwp_table_tools", HwpTableTools(controller))
+            _set_last_hwp_error(None)
             logger.info("Successfully connected to HWP program")
+            hwp_controller = controller
         except Exception as e:
             logger.error(f"Error creating HwpController: {str(e)}", exc_info=True)
+            _set_last_hwp_error(str(e))
             return None
     return hwp_controller
 
 def get_hwp_table_tools():
     """Get or create HwpTableTools instance."""
-    global hwp_table_tools, hwp_controller
+    hwp_table_tools = _get_thread_state("hwp_table_tools")
     if hwp_table_tools is None:
         hwp_controller = get_hwp_controller()
         if hwp_controller:
             hwp_table_tools = HwpTableTools(hwp_controller)
+            _set_thread_state("hwp_table_tools", hwp_table_tools)
     return hwp_table_tools
 
 @mcp.tool()
@@ -130,7 +176,7 @@ def hwp_create() -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
         
         if hwp.create_new_document():
             logger.info("Successfully created new document")
@@ -152,7 +198,7 @@ def hwp_list_tabs() -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
 
         success, documents = hwp.get_open_documents()
         if not success:
@@ -185,7 +231,7 @@ def hwp_switch_tab(index: int) -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
 
         success, message = hwp.switch_document(index)
         if success:
@@ -209,7 +255,7 @@ def hwp_list_windows() -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
 
         success, instances = hwp.get_all_hwp_instances()
         if not success:
@@ -242,7 +288,7 @@ def hwp_switch_window(hwnd: int) -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
 
         success, message = hwp.connect_to_hwp_instance(hwnd)
         if success:
@@ -268,7 +314,7 @@ def hwp_close_window(hwnd: int) -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
 
         success, message = hwp.close_hwp_window(hwnd)
         if success:
@@ -289,7 +335,7 @@ def hwp_open(path: str) -> str:
         
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
         
         if hwp.open_document(path):
             logger.info(f"Successfully opened document: {path}")
@@ -306,7 +352,7 @@ def hwp_save(path: str = None) -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
         
         if path:
             if hwp.save_document(path):
@@ -315,7 +361,7 @@ def hwp_save(path: str = None) -> str:
             else:
                 return "Error: Failed to save document"
         else:
-            temp_path = os.path.join(os.getcwd(), "temp_document.hwp")
+            temp_path = _default_temp_document_path()
             if hwp.save_document(temp_path):
                 logger.info(f"Successfully saved document to temporary location: {temp_path}")
                 return f"Document saved to: {temp_path}"
@@ -334,7 +380,7 @@ def hwp_insert_text(text: str, preserve_linebreaks: bool = True) -> str:
         
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
 
         # 현재 커서가 표 안에 있는지 확인
         is_in_table = False
@@ -397,7 +443,7 @@ def hwp_set_font(
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
         
         # 현재 선택된 텍스트에 대해 글자 모양 설정
         if hwp.set_font_style(
@@ -424,7 +470,7 @@ def hwp_insert_table(rows: int, cols: int) -> str:
         # HwpTableTools 인스턴스 가져오기
         table_tools = get_hwp_table_tools()
         if not table_tools:
-            return "Error: Failed to get table tools instance"
+            return _connection_error_response()
         
         return table_tools.insert_table(rows, cols)
     except Exception as e:
@@ -437,7 +483,7 @@ def hwp_insert_paragraph() -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
         
         if hwp.insert_paragraph():
             logger.info("Successfully inserted paragraph")
@@ -454,7 +500,7 @@ def hwp_get_text() -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
         
         text = hwp.get_text()
         if text is not None:
@@ -481,7 +527,7 @@ def hwp_close_document(save: bool = False, suppress_dialog: bool = True) -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: HWP is not connected"
+            return _connection_error_response()
 
         if hwp.close_document(save, suppress_dialog):
             logger.info(f"Successfully closed document (save={save}, suppress_dialog={suppress_dialog})")
@@ -507,7 +553,7 @@ def hwp_close_all_documents(save: bool = False, suppress_dialog: bool = True) ->
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: HWP is not connected"
+            return _connection_error_response()
 
         if hwp.close_all_documents(save, suppress_dialog):
             logger.info(f"Successfully closed all documents (save={save}, suppress_dialog={suppress_dialog})")
@@ -532,7 +578,7 @@ def hwp_undo(count: int = 1) -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
 
         success, message = hwp.undo(count)
         if success:
@@ -558,7 +604,7 @@ def hwp_redo(count: int = 1) -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
 
         success, message = hwp.redo(count)
         if success:
@@ -587,7 +633,7 @@ def hwp_find_text(text: str) -> str:
 
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
 
         if hwp.find_text(text):
             logger.info(f"Found text: {text}")
@@ -617,7 +663,7 @@ def hwp_replace_text(find: str, replace: str, replace_all: bool = True) -> str:
 
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
 
         if hwp.replace_text(find, replace, replace_all):
             logger.info(f"Replaced text: '{find}' -> '{replace}' (replace_all={replace_all})")
@@ -680,7 +726,7 @@ def hwp_create_table_with_data(rows: int, cols: int, data = None, has_header: bo
         # HwpTableTools 인스턴스 가져오기
         table_tools = get_hwp_table_tools()
         if not table_tools:
-            return "Error: Failed to get table tools instance"
+            return _connection_error_response()
         
         # 현재 커서가 표 안에 있는지 확인
         hwp = get_hwp_controller()
@@ -795,7 +841,7 @@ def hwp_create_complete_document(document_spec: dict) -> dict:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return {"status": "error", "message": "Failed to connect to HWP program"}
+            return _connection_error_payload()
         
         # 새 문서 생성
         if not hwp.create_new_document():
@@ -1012,7 +1058,7 @@ def hwp_create_document_from_text(content: str, title: str = None, format_conten
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return {"status": "error", "message": "Failed to connect to HWP program"}
+            return _connection_error_payload()
         
         # 새 문서 생성
         if not hwp.create_new_document():
@@ -1159,7 +1205,7 @@ def hwp_batch_operations(operations: list) -> dict:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return {"status": "error", "message": "Failed to connect to HWP program"}
+            return _connection_error_payload()
         
         results = []
         
@@ -1193,7 +1239,7 @@ def hwp_batch_operations(operations: list) -> dict:
                     if path and hwp.save_document(path):
                         result["message"] = f"Document saved to: {path}"
                     elif not path:
-                        temp_path = os.path.join(os.getcwd(), "temp_document.hwp")
+                        temp_path = _default_temp_document_path()
                         if hwp.save_document(temp_path):
                             result["message"] = f"Document saved to: {temp_path}"
                             result["path"] = temp_path
@@ -1275,7 +1321,7 @@ def hwp_batch_operations(operations: list) -> dict:
                     table_tools = get_hwp_table_tools()
                     if not table_tools:
                         result["status"] = "error"
-                        result["message"] = "Failed to get table tools instance"
+                        result["message"] = _connection_error_message()
                     elif rows <= 0 or cols <= 0:
                         result["status"] = "error"
                         result["message"] = "Valid rows and cols are required"
@@ -1300,7 +1346,7 @@ def hwp_batch_operations(operations: list) -> dict:
                     table_tools = get_hwp_table_tools()
                     if not table_tools:
                         result["status"] = "error"
-                        result["message"] = "Failed to get table tools instance"
+                        result["message"] = _connection_error_message()
                     elif row <= 0 or col <= 0:
                         result["status"] = "error"
                         result["message"] = "Valid row and col are required"
@@ -1319,7 +1365,7 @@ def hwp_batch_operations(operations: list) -> dict:
                     table_tools = get_hwp_table_tools()
                     if not table_tools:
                         result["status"] = "error"
-                        result["message"] = "Failed to get table tools instance"
+                        result["message"] = _connection_error_message()
                     elif start_row <= 0 or start_col <= 0 or end_row <= 0 or end_col <= 0:
                         result["status"] = "error"
                         result["message"] = "Valid cell coordinates are required"
@@ -1342,9 +1388,8 @@ def hwp_batch_operations(operations: list) -> dict:
                     save = params.get("save", True)
                     if hwp.disconnect():
                         result["message"] = "Document closed successfully"
-                        # 전역 변수 초기화
-                        global hwp_controller
-                        hwp_controller = None
+                        _clear_hwp_thread_state()
+                        _set_last_hwp_error(None)
                     else:
                         result["status"] = "error"
                         result["message"] = "Failed to close document"
@@ -1408,7 +1453,7 @@ def hwp_fill_table_with_data(data, start_row: int = 1, start_col: int = 1, has_h
     try:
         table_tools = get_hwp_table_tools()
         if not table_tools:
-            return "Error: Failed to get table tools instance"
+            return _connection_error_response()
         
         # 데이터 형식 로깅
         logger.info(f"Received data type: {type(data)}, data: {str(data)[:100]}...")
@@ -1510,7 +1555,7 @@ def hwp_navigate(direction: str) -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: HWP 프로그램에 연결할 수 없습니다."
+            return _connection_error_response()
 
         success, dir_used, cell_text = hwp.navigate_and_get_cell(direction)
 
@@ -1539,7 +1584,7 @@ def hwp_find_and_show_cell(text: str) -> str:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: HWP 프로그램에 연결할 수 없습니다."
+            return _connection_error_response()
 
         success, cell_text = hwp.find_and_get_cell(text)
 
@@ -1590,7 +1635,7 @@ def hwp_table_view(depth: int = 1) -> dict:
     try:
         hwp = get_hwp_controller()
         if not hwp:
-            return {"error": "HWP 프로그램에 연결할 수 없습니다."}
+            return {"error": _connection_error_message()}
 
         # depth 제한
         depth = min(max(depth, 1), 5)
@@ -1673,7 +1718,7 @@ def hwp_fill_cells(
 
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: HWP 프로그램에 연결할 수 없습니다."
+            return _connection_error_response()
 
         # 배치 처리 (direction은 경로에서 결정되므로 "right"를 기본값으로)
         results = hwp.fill_cells_by_path_batch(path_value_map, "right", mode)
@@ -1720,7 +1765,7 @@ def hwp_fill_column_numbers(start: int = 1, end: int = 10, column: int = 1, from
         # HWP 컨트롤러 가져오기
         hwp = get_hwp_controller()
         if not hwp:
-            return "Error: Failed to connect to HWP program"
+            return _connection_error_response()
         
         # 표 선택 (현재 커서 위치에 표가 있어야 함)
         logger.info(f"테이블 열에 숫자 채우기: 열 {column}, {start}부터 {end}까지")

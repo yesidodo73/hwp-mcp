@@ -15,6 +15,30 @@ from typing import Optional, List, Dict, Any, Tuple
 logger = logging.getLogger("hwp-controller")
 
 
+def print(*args, **kwargs):  # type: ignore[override]
+    """Route legacy debug/error prints into the logger.
+
+    The MCP server uses stdio for transport, so writing arbitrary text to
+    stdout/stderr can corrupt responses. Logging also avoids Windows console
+    encoding crashes when messages contain Korean text.
+    """
+    sep = kwargs.get("sep", " ")
+    end = kwargs.get("end", "")
+    message = sep.join(str(arg) for arg in args) + end
+    message = message.rstrip()
+
+    level = logging.INFO
+    lowered = message.lower()
+    if "[debug]" in lowered:
+        level = logging.DEBUG
+    elif "실패" in message or lowered.startswith("error"):
+        level = logging.ERROR
+    elif "경고" in message:
+        level = logging.WARNING
+
+    logger.log(level, message)
+
+
 class HwpController:
     """한글 문서를 제어하는 클래스"""
 
@@ -24,6 +48,146 @@ class HwpController:
         self.visible = True
         self.is_hwp_running = False
         self.current_document_path = None
+        self.last_error = None
+
+    def _clear_error(self) -> None:
+        """마지막 오류 상태를 초기화합니다."""
+        self.last_error = None
+
+    def _record_error(
+        self,
+        message: str,
+        exc: Optional[Exception] = None,
+        level: int = logging.ERROR,
+    ) -> str:
+        """오류 메시지를 기록하고 마지막 오류 상태를 저장합니다."""
+        detail = message if exc is None else f"{message}: {exc}"
+        self.last_error = detail
+        logger.log(level, detail, exc_info=exc is not None and level >= logging.ERROR)
+        return detail
+
+    def _ensure_com_initialized(self) -> None:
+        """현재 스레드에서 COM을 초기화합니다."""
+        try:
+            pythoncom.CoInitialize()
+        except Exception as e:
+            logger.debug(f"CoInitialize 건너뜀: {e}")
+
+    def _list_visible_hwp_windows(self) -> List[Dict[str, Any]]:
+        """현재 실행 중인 HWP 창 목록을 반환합니다."""
+        results: List[Dict[str, Any]] = []
+
+        def enum_hwp_windows(hwnd, windows):
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+
+                class_name = win32gui.GetClassName(hwnd)
+                if class_name == "HwpFrame" or "Hwp" in class_name:
+                    title = win32gui.GetWindowText(hwnd)
+                    if title:
+                        windows.append({
+                            "hwnd": hwnd,
+                            "title": title,
+                            "class": class_name,
+                        })
+            except Exception as e:
+                logger.debug(f"창 정보 조회 실패 hwnd={hwnd}: {e}")
+            return True
+
+        win32gui.EnumWindows(enum_hwp_windows, results)
+        return results
+
+    def _wait_until_ready(self, retries: int = 10, delay: float = 0.2) -> bool:
+        """COM 객체가 문서 창을 정상적으로 노출할 때까지 잠시 대기합니다."""
+        if not self.hwp:
+            return False
+
+        for _ in range(retries):
+            try:
+                _ = self.hwp.XHwpWindows.Count
+                return True
+            except Exception as e:
+                logger.debug(f"HWP 준비 대기 중: {e}")
+                time.sleep(delay)
+
+        return False
+
+    def _security_module_path(self) -> str:
+        """보안 모듈 DLL 경로를 계산합니다."""
+        project_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        return os.path.join(
+            project_root,
+            "security_module",
+            "FilePathCheckerModuleExample.dll",
+        )
+
+    def _get_active_document_path(self) -> Optional[str]:
+        """현재 활성 문서의 경로를 가져옵니다."""
+        if not self.hwp:
+            return None
+
+        try:
+            path = self.hwp.Path
+            if path:
+                return os.path.abspath(path)
+        except Exception as e:
+            logger.debug(f"HWP Path 조회 실패: {e}")
+
+        try:
+            current_idx = self.hwp.CurDocIndex
+            doc = self.hwp.XHwpDocuments.Item(current_idx)
+            path = getattr(doc, "Path", "")
+            if path:
+                return os.path.abspath(path)
+        except Exception as e:
+            logger.debug(f"활성 문서 경로 조회 실패: {e}")
+
+        return None
+
+    def _register_security_module(self) -> None:
+        """파일 경로 보안 모듈을 등록합니다."""
+        module_path = self._security_module_path()
+        if os.path.exists(module_path):
+            self.hwp.RegisterModule("FilePathCheckerModuleExample", module_path)
+            print(f"보안 모듈이 등록되었습니다: {module_path}")
+        else:
+            print(f"보안 모듈 파일이 없어 등록을 건너뜁니다: {module_path}")
+
+    def _finalize_connection(
+        self,
+        hwp,
+        visible: bool,
+        register_security_module: bool,
+    ) -> bool:
+        """연결된 HWP COM 객체를 초기화하고 상태를 동기화합니다."""
+        self.hwp = hwp
+
+        if not self._wait_until_ready():
+            self.hwp = None
+            self.is_hwp_running = False
+            self.current_document_path = None
+            self._record_error("한글 창 초기화에 실패했습니다.")
+            return False
+
+        if register_security_module:
+            try:
+                self._register_security_module()
+            except Exception as e:
+                logger.warning(f"보안 모듈 등록 실패 (계속 진행): {e}")
+
+        try:
+            self.hwp.XHwpWindows.Item(0).Visible = visible
+        except Exception as e:
+            logger.debug(f"가시성 설정 실패 (무시): {e}")
+
+        self.visible = visible
+        self.is_hwp_running = True
+        self.current_document_path = self._get_active_document_path()
+        self._clear_error()
+        return True
 
     def connect(self, visible: bool = True, register_security_module: bool = True) -> bool:
         """
@@ -36,33 +200,40 @@ class HwpController:
         Returns:
             bool: 연결 성공 여부
         """
-        try:
-            # GetActiveObject 시도
+        self._ensure_com_initialized()
+        self.hwp = None
+        self.is_hwp_running = False
+        self.current_document_path = None
+        self.visible = visible
+        self._clear_error()
+
+        active_object_error = None
+        for attempt in range(3):
             try:
-                self.hwp = win32com.client.GetActiveObject("HWPFrame.HwpObject")
+                hwp = win32com.client.GetActiveObject("HWPFrame.HwpObject")
                 logger.info("GetActiveObject 성공 - 기존 HWP 인스턴스에 연결됨")
+                return self._finalize_connection(hwp, visible, register_security_module)
             except Exception as e:
-                logger.warning(f"GetActiveObject 실패: {e}")
-                # Dispatch는 새 창을 열 수 있음 - HWP의 한계
-                self.hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
-                logger.info("Dispatch로 HWP에 연결됨 (새 창이 열렸을 수 있음)")
-            
-            # 보안 모듈 등록 (파일 경로 체크 보안 경고창 방지)
-            if register_security_module:
-                try:
-                    # 보안 모듈 DLL 경로 - 실제 파일이 위치한 경로로 수정 필요
-                    module_path = os.path.abspath("D:/hwp-mcp/security_module/FilePathCheckerModuleExample.dll")
-                    self.hwp.RegisterModule("FilePathCheckerModuleExample", module_path)
-                    print("보안 모듈이 등록되었습니다.")
-                except Exception as e:
-                    print(f"보안 모듈 등록 실패 (무시하고 계속 진행): {e}")
-            
-            self.visible = visible
-            self.hwp.XHwpWindows.Item(0).Visible = visible
-            self.is_hwp_running = True
-            return True
+                active_object_error = e
+                logger.warning(f"GetActiveObject 실패 (시도 {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    time.sleep(0.3)
+
+        running_windows = self._list_visible_hwp_windows()
+        if running_windows:
+            window_titles = ", ".join(win["title"] for win in running_windows[:3])
+            self._record_error(
+                f"한글 창은 실행 중이지만 COM 연결에 실패했습니다. 열린 창: {window_titles}. 한글을 완전히 종료한 뒤 다시 실행해 주세요",
+                active_object_error,
+            )
+            return False
+
+        try:
+            hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
+            logger.info("Dispatch로 HWP에 연결됨 (새 창이 열렸을 수 있음)")
+            return self._finalize_connection(hwp, visible, register_security_module)
         except Exception as e:
-            print(f"한글 프로그램 연결 실패: {e}")
+            self._record_error("한글 프로그램 시작/연결 실패", e)
             return False
 
     def disconnect(self) -> bool:
@@ -199,14 +370,15 @@ class HwpController:
             bool: 생성 성공 여부
         """
         try:
-            if not self.is_hwp_running:
-                self.connect()
+            if not self.is_hwp_running and not self.connect():
+                return False
             
             self.hwp.Run("FileNew")
             self.current_document_path = None
+            self._clear_error()
             return True
         except Exception as e:
-            print(f"새 문서 생성 실패: {e}")
+            self._record_error("새 문서 생성 실패", e)
             return False
 
     def get_open_documents(self) -> Tuple[bool, List[Dict[str, Any]]]:
@@ -381,37 +553,24 @@ class HwpController:
                 return False, f"창 활성화 실패: {e}"
 
             time.sleep(0.5)
+            self._ensure_com_initialized()
 
-            # COM 재초기화
-            try:
-                pythoncom.CoInitialize()
-            except Exception as e:
-                logger.debug(f"CoInitialize: {e}")  # 이미 초기화된 경우
-
-            # 방법 1: GetActiveObject 시도
-            try:
-                self.hwp = win32com.client.GetActiveObject("HWPFrame.HwpObject")
-                self.is_hwp_running = True
-                logger.info(f"GetActiveObject 성공: {title}")
-                return True, f"HWP 인스턴스에 연결됨: {title}"
-            except Exception as e:
-                logger.warning(f"GetActiveObject 실패: {e}")
-
-            # 방법 2: Dispatch로 연결 (활성화된 HWP에 연결됨)
-            try:
-                self.hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
-                self.is_hwp_running = True
-                logger.info(f"Dispatch로 연결됨")
-                # Dispatch 후 현재 문서 경로로 확인
+            active_object_error = None
+            for attempt in range(3):
                 try:
-                    current_path = self.hwp.Path
-                    return True, f"HWP에 연결됨: {title} (문서: {current_path or '새 문서'})"
+                    hwp = win32com.client.GetActiveObject("HWPFrame.HwpObject")
+                    logger.info(f"GetActiveObject 성공: {title}")
+                    if self._finalize_connection(hwp, self.visible, register_security_module=True):
+                        return True, f"HWP 인스턴스에 연결됨: {title}"
+                    return False, self.last_error or "연결 실패"
                 except Exception as e:
-                    logger.debug(f"Path 가져오기 실패: {e}")
-                    return True, f"HWP에 연결됨: {title}"
-            except Exception as e:
-                logger.error(f"Dispatch 실패: {e}")
-                return False, f"연결 실패: {e}"
+                    active_object_error = e
+                    logger.warning(f"GetActiveObject 실패 (시도 {attempt + 1}/3): {e}")
+                    if attempt < 2:
+                        time.sleep(0.3)
+
+            message = self._record_error("활성 HWP 창 COM 연결 실패", active_object_error)
+            return False, message
 
         except Exception as e:
             return False, f"연결 실패: {e}"
@@ -445,10 +604,14 @@ class HwpController:
             bool: 열기 성공 여부
         """
         try:
-            if not self.is_hwp_running:
-                self.connect()
+            if not self.is_hwp_running and not self.connect():
+                return False
 
             abs_path = os.path.abspath(file_path)
+            if not os.path.exists(abs_path):
+                self._record_error(f"문서 파일을 찾을 수 없습니다: {abs_path}", level=logging.WARNING)
+                return False
+
             print(f"[DEBUG] Opening document: {abs_path}")
             print(f"[DEBUG] File exists: {os.path.exists(abs_path)}")
 
@@ -461,11 +624,10 @@ class HwpController:
             print(f"[DEBUG] FileOpen result: {result}")
             if result:
                 self.current_document_path = abs_path
+                self._clear_error()
             return result
         except Exception as e:
-            print(f"문서 열기 실패: {e}")
-            import traceback
-            traceback.print_exc()
+            self._record_error("문서 열기 실패", e)
             return False
 
     def save_document(self, file_path: Optional[str] = None) -> bool:
@@ -484,20 +646,26 @@ class HwpController:
             
             if file_path:
                 abs_path = os.path.abspath(file_path)
+                parent_dir = os.path.dirname(abs_path)
+                if parent_dir:
+                    os.makedirs(parent_dir, exist_ok=True)
                 # 파일 형식과 경로 모두 지정하여 저장
                 self.hwp.SaveAs(abs_path, "HWP", "")
                 self.current_document_path = abs_path
             else:
-                if self.current_document_path:
+                active_path = self._get_active_document_path()
+                if active_path:
                     self.hwp.Save()
+                    self.current_document_path = active_path
                 else:
                     # 저장 대화 상자 표시 (파라미터 없이 호출)
                     self.hwp.SaveAs()
                     # 대화 상자에서 사용자가 선택한 경로를 알 수 없으므로 None 유지
             
+            self._clear_error()
             return True
         except Exception as e:
-            print(f"문서 저장 실패: {e}")
+            self._record_error("문서 저장 실패", e)
             return False
 
     def insert_text(self, text: str, preserve_linebreaks: bool = True) -> bool:
@@ -528,7 +696,7 @@ class HwpController:
                 # 줄바꿈이 없거나 유지하지 않는 경우 한 번에 처리
                 return self._insert_text_direct(text)
         except Exception as e:
-            print(f"텍스트 삽입 실패: {e}")
+            self._record_error("텍스트 삽입 실패", e)
             return False
 
     def _set_table_cursor(self) -> bool:

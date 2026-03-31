@@ -34,10 +34,7 @@ cd hwp-mcp
 pip install -r requirements.txt
 ```
 
-3. (선택사항) MCP 패키지 설치:
-```bash
-pip install mcp
-```
+`requirements.txt` 에는 MCP 서버 실행에 필요한 `mcp` 패키지가 포함되어 있습니다.
 
 ## 사용 방법
 
